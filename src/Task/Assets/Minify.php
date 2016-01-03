@@ -1,8 +1,10 @@
 <?php
 namespace Robo\Task\Assets;
 
+use Robo\Common\Glob;
 use Robo\Result;
 use Robo\Task\BaseTask;
+use Robo\Exception\TaskException;
 
 /**
  * Minifies asset file (CSS or JS).
@@ -22,8 +24,13 @@ use Robo\Task\BaseTask;
  */
 class Minify extends BaseTask
 {
+    use Glob;
+
     /** @var array $types */
     protected $types = ['css', 'js'];
+
+    /** @var array $files */
+    protected $files = [];
 
     /** @var string $text */
     protected $text;
@@ -48,11 +55,26 @@ class Minify extends BaseTask
      */
     public function __construct($input)
     {
-        if (file_exists($input)) {
-            return $this->fromFile($input);
-        }
+        if (is_array($input)) {
+            // if input is array handle it as array of files
+            $this->files = $input;
 
-        return $this->fromText($input);
+            return $this;
+        } else {
+            // if input is not an array try to glob it
+            $files = $this->glob()->glob($input);
+            if (is_array($files)) {
+                // if the glob returned an array of files
+                $this->files = $files;
+
+                return $this;
+            } else {
+                // if the glob returned no files, handle the input as text
+                $this->files = [null];
+
+                return $this->fromText($input);
+            }
+        }
     }
 
     /**
@@ -86,6 +108,8 @@ class Minify extends BaseTask
 
         if (in_array($type, $this->types)) {
             $this->type = $type;
+        } else {
+            throw new TaskException($this, sprintf('Unsupported extension "%s".', $type));
         }
 
         return $this;
@@ -107,7 +131,7 @@ class Minify extends BaseTask
     }
 
     /**
-     * Sets text from asset file path. Tries to guess type and set default destination.
+     * Sets text from asset file path. Tries to guess type.
      *
      * @param string $path
      *
@@ -116,14 +140,48 @@ class Minify extends BaseTask
     protected function fromFile($path)
     {
         $this->text = file_get_contents($path);
-
         unset($this->type);
         $this->type($this->getExtension($path));
 
-        if (empty($this->dst) && !empty($this->type)) {
-            $ext_length = strlen($this->type) + 1;
-            $this->dst = substr($path, 0, -$ext_length) . '.min.' . $this->type;
+        return $this;
+    }
+
+    /**
+     * Sets the destination from asset file path.
+     *
+     * @param string $path
+     *
+     * @return $this
+     */
+    protected function setDestination($files)
+    {
+        // store the source and destination in key=>value pairs
+        foreach ($files as $k => $v) {
+            $from = $k;
+            $to = $v;
+            // check if target was given with the to() method instead of key/value pairs
+            if (is_int($k)) {
+                $from = $v;
+                if (isset($this->dst)) {
+                    $to = $this->dst;
+                } else {
+                    // target was not defined, make it the default one
+                    $ext = $this->getExtension($from);
+                    $ext_length = strlen($ext) + 1;
+                    $to = substr($from, 0, -$ext_length).'.min.'.$ext;
+                }
+            }
+            // if it is a directory, append the source filename
+            if (is_dir($to)) {
+                $to = $to.'/'.basename($from);
+            }
+            // store the new key and value
+            $files[$from] = $to;
+            // delete the old key
+            unset($files[$k]);
         }
+        // store the prepared array
+        $this->files = $files;
 
         return $this;
     }
@@ -143,9 +201,11 @@ class Minify extends BaseTask
     /**
      * Minifies and returns text.
      *
+     * @param string $text
+     *
      * @return string|bool
      */
-    protected function getMinifiedText()
+    protected function getMinifiedText($text)
     {
         switch ($this->type) {
             case 'css':
@@ -153,7 +213,7 @@ class Minify extends BaseTask
                     return Result::errorMissingPackage($this, 'CssMin', 'natxet/CssMin');
                 }
 
-                return \CssMin::minify($this->text);
+                return \CssMin::minify($text);
                 break;
 
             case 'js':
@@ -168,7 +228,7 @@ class Minify extends BaseTask
                 }
 
                 return $jsqueeze->squeeze(
-                    $this->text,
+                    $text,
                     $this->squeezeOptions['singleLine'],
                     $this->squeezeOptions['keepImportantComments'],
                     $this->squeezeOptions['specialVarRx']
@@ -187,6 +247,7 @@ class Minify extends BaseTask
     public function singleLine($singleLine)
     {
         $this->squeezeOptions['singleLine'] = (bool)$singleLine;
+
         return $this;
     }
 
@@ -198,6 +259,7 @@ class Minify extends BaseTask
     public function keepImportantComments($keepImportantComments)
     {
         $this->squeezeOptions['keepImportantComments'] = (bool)$keepImportantComments;
+
         return $this;
     }
 
@@ -209,6 +271,7 @@ class Minify extends BaseTask
     public function specialVarRx($specialVarRx)
     {
         $this->squeezeOptions['specialVarRx'] = (bool)$specialVarRx;
+
         return $this;
     }
 
@@ -217,7 +280,7 @@ class Minify extends BaseTask
      */
     public function __toString()
     {
-        return $this->getMinifiedText();
+        return $this->getMinifiedText($this->text);
     }
 
     /**
@@ -227,50 +290,58 @@ class Minify extends BaseTask
      */
     public function run()
     {
-        if (empty($this->type)) {
-            return Result::error($this, 'Unknown asset type.');
+        // process the files
+        $this->setDestination($this->files);
+
+        foreach ($this->files as $source => $dst) {
+            // get text either already defined by fromText or fromFile
+            if (isset($this->text)) {
+                $text = $this->text;
+            } else {
+                $text = $this->fromFile($source);
+            }
+
+            // get type
+            unset($this->type);
+            $this->type($this->getExtension($source));
+
+            $size_before = strlen($text);
+            $minified = $this->getMinifiedText($text);
+
+            if ($minified instanceof Result) {
+                return $minified;
+            } elseif (false === $minified) {
+                return Result::error($this, 'Minification failed.');
+            }
+
+            $size_after = strlen($minified);
+            $write_result = file_put_contents($dst.'.part', $minified);
+            rename($dst.'.part', $dst);
+
+            if (false === $write_result) {
+                return Result::error($this, 'File write failed.');
+            }
+            if ($size_before === 0) {
+                $minified_percent = 0;
+            } else {
+                $minified_percent = number_format(100 - ($size_after / $size_before * 100), 1);
+            }
+            $this->printTaskSuccess(
+                sprintf(
+                    'Wrote <info>%s</info>',
+                    $dst
+                )
+            );
+            $this->printTaskSuccess(
+                sprintf(
+                    'Wrote <info>%s</info> (reduced by <info>%s</info> / <info>%s%%</info>)',
+                    $this->formatBytes($size_after),
+                    $this->formatBytes(($size_before - $size_after)),
+                    $minified_percent
+                )
+            );
         }
 
-        if (empty($this->dst)) {
-            return Result::error($this, 'Unknown file destination.');
-        }
-
-        $size_before = strlen($this->text);
-        $minified = $this->getMinifiedText();
-
-        if ($minified instanceof Result) {
-            return $minified;
-        } elseif (false === $minified) {
-            return Result::error($this, 'Minification failed.');
-        }
-
-        $size_after = strlen($minified);
-        $dst = $this->dst . '.part';
-        $write_result = file_put_contents($dst, $minified);
-        rename($dst, $this->dst);
-
-        if (false === $write_result) {
-            return Result::error($this, 'File write failed.');
-        }
-        if ($size_before === 0) {
-            $minified_percent = 0;
-        } else {
-            $minified_percent = number_format(100 - ($size_after / $size_before * 100), 1);
-        }
-        $this->printTaskSuccess(
-            sprintf(
-                'Wrote <info>%s</info>',
-                $this->dst
-            )
-        );
-        $this->printTaskSuccess(
-            sprintf(
-                'Wrote <info>%s</info> (reduced by <info>%s</info> / <info>%s%%</info>)',
-                $this->formatBytes($size_after),
-                $this->formatBytes(($size_before - $size_after)),
-                $minified_percent
-            )
-        );
-        return Result::success($this, 'Asset minified.');
+        return Result::success($this, 'Asset(s) minified.');
     }
 }
